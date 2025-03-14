@@ -7,6 +7,7 @@ import java.awt.event.ActionListener;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 
 import javax.swing.ImageIcon;
 import javax.swing.JButton;
@@ -102,34 +103,40 @@ public class Transfer extends JFrame implements ActionListener {
 public void actionPerformed(ActionEvent ae) {
     if (ae.getSource() == bTransfer) {
         String recipientCard = textRecipient.getText();
-        String amountStr = textAmount.getText();
-
-        if (recipientCard.isEmpty() || amountStr.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "All fields are required!", "Error", JOptionPane.ERROR_MESSAGE);
+        String amountText = textAmount.getText();
+        
+        if (recipientCard.isEmpty() || amountText.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Please enter recipient card and amount.", "Error", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        double amount;
+        try {
+            amount = Double.parseDouble(amountText);
+            if (amount <= 0) {
+                JOptionPane.showMessageDialog(this, "Enter a valid amount.", "Error", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+        } catch (NumberFormatException e) {
+            JOptionPane.showMessageDialog(this, "Invalid amount format.", "Error", JOptionPane.ERROR_MESSAGE);
             return;
         }
 
-        Connn conn = null;
+        // ✅ Ensure proper initialization of Conn object
         try {
-            double transferAmount = Double.parseDouble(amountStr);
-
-            if (transferAmount <= 0) {
-                JOptionPane.showMessageDialog(this, "Amount must be greater than zero.", "Error", JOptionPane.ERROR_MESSAGE);
-                return;
-            }
-
-            conn = new Connn();
-            conn.c.setAutoCommit(false); 
-
-            // Get sender's account info using the PIN
+            Connn conn = new Connn(); // ✅ Fix: Create Conn object inside try
+            conn.c.setAutoCommit(false); // Start transaction
+            
+            // Fetch sender details
             String fetchSenderQuery = """
-                SELECT a.account_id, a.balance, a.card_no
-                FROM accounts a
+                SELECT u.user_id, a.balance, a.account_id, a.card_no
+                FROM users u
+                JOIN accounts a ON u.user_id = a.user_id
                 JOIN login l ON a.card_no = l.card_no
                 WHERE l.pin_no = ?
             """;
             PreparedStatement psFetchSender = conn.c.prepareStatement(fetchSenderQuery);
-            psFetchSender.setString(1, pin); // Ensure 'pin' is passed to this method
+            psFetchSender.setString(1, pin);
             ResultSet rsSender = psFetchSender.executeQuery();
 
             if (!rsSender.next()) {
@@ -137,17 +144,23 @@ public void actionPerformed(ActionEvent ae) {
                 return;
             }
 
+            int senderUserId = rsSender.getInt("user_id");
             int senderAccountId = rsSender.getInt("account_id");
             double senderBalance = rsSender.getDouble("balance");
             String senderCard = rsSender.getString("card_no");
 
-            if (transferAmount > senderBalance) {
+            if (senderBalance < amount) {
                 JOptionPane.showMessageDialog(this, "Insufficient balance.", "Error", JOptionPane.ERROR_MESSAGE);
                 return;
             }
 
-            // Get recipient's account info
-            String fetchRecipientQuery = "SELECT account_id FROM accounts WHERE card_no = ?";
+            // Fetch recipient details
+            String fetchRecipientQuery = """
+                SELECT u.user_id, a.account_id 
+                FROM users u
+                JOIN accounts a ON u.user_id = a.user_id
+                WHERE a.card_no = ?
+            """;
             PreparedStatement psFetchRecipient = conn.c.prepareStatement(fetchRecipientQuery);
             psFetchRecipient.setString(1, recipientCard);
             ResultSet rsRecipient = psFetchRecipient.executeQuery();
@@ -157,71 +170,67 @@ public void actionPerformed(ActionEvent ae) {
                 return;
             }
 
+            int recipientUserId = rsRecipient.getInt("user_id");
             int recipientAccountId = rsRecipient.getInt("account_id");
 
-            String updateSenderBalance = "UPDATE accounts SET balance = balance - ? WHERE account_id = ?";
-            PreparedStatement psUpdateSender = conn.c.prepareStatement(updateSenderBalance);
-            psUpdateSender.setDouble(1, transferAmount);
-            psUpdateSender.setInt(2, senderAccountId);
-            psUpdateSender.executeUpdate();
+            // Deduct money from sender
+            String deductMoneyQuery = "UPDATE accounts SET balance = balance - ? WHERE account_id = ?";
+            PreparedStatement psDeductMoney = conn.c.prepareStatement(deductMoneyQuery);
+            psDeductMoney.setDouble(1, amount);
+            psDeductMoney.setInt(2, senderAccountId);
+            psDeductMoney.executeUpdate();
 
-            // Add amount to recipient
-            String updateRecipientBalance = "UPDATE accounts SET balance = balance + ? WHERE account_id = ?";
-            PreparedStatement psUpdateRecipient = conn.c.prepareStatement(updateRecipientBalance);
-            psUpdateRecipient.setDouble(1, transferAmount);
-            psUpdateRecipient.setInt(2, recipientAccountId);
-            psUpdateRecipient.executeUpdate();
+            // Add money to recipient
+            String addMoneyQuery = "UPDATE accounts SET balance = balance + ? WHERE account_id = ?";
+            PreparedStatement psAddMoney = conn.c.prepareStatement(addMoneyQuery);
+            psAddMoney.setDouble(1, amount);
+            psAddMoney.setInt(2, recipientAccountId);
+            psAddMoney.executeUpdate();
 
-            // Log the transaction for sender
-            String logSenderTransaction = """
-                INSERT INTO transactions (account_id, transaction_type, amount, description)
-                VALUES (?, ?, ?, ?)
-            """;
-            PreparedStatement psLogSender = conn.c.prepareStatement(logSenderTransaction);
-            psLogSender.setInt(1, senderAccountId);
-            psLogSender.setString(2, "Transfer Out");
-            psLogSender.setDouble(3, transferAmount);
-            psLogSender.setString(4, "Transferred to card: " + recipientCard);
-            psLogSender.executeUpdate();
+            // Log Transaction
+            String logTransactionQuery = "INSERT INTO transactions (account_id, transaction_type, amount) VALUES (?, 'Transfer', ?)";
+            PreparedStatement psLogTransaction = conn.c.prepareStatement(logTransactionQuery, Statement.RETURN_GENERATED_KEYS);
+            psLogTransaction.setInt(1, senderAccountId);
+            psLogTransaction.setDouble(2, amount);
+            psLogTransaction.executeUpdate();
 
-            // Log the transaction for recipient
-            String logRecipientTransaction = """
-                INSERT INTO transactions (account_id, transaction_type, amount, description)
-                VALUES (?, ?, ?, ?)
-            """;
-            PreparedStatement psLogRecipient = conn.c.prepareStatement(logRecipientTransaction);
-            psLogRecipient.setInt(1, recipientAccountId);
-            psLogRecipient.setString(2, "Transfer In");
-            psLogRecipient.setDouble(3, transferAmount);
-            psLogRecipient.setString(4, "Received from card: " + senderCard);
-            psLogRecipient.executeUpdate();
+            // Get transaction ID
+            ResultSet rsTransaction = psLogTransaction.getGeneratedKeys();
+            int transactionId = -1;
+            if (rsTransaction.next()) {
+                transactionId = rsTransaction.getInt(1);
+            }
 
-            conn.c.commit(); 
-            conn.c.setAutoCommit(true);
+            // Log fund transfer
+            String logFundTransferQuery = "INSERT INTO fundTransfers (sender_id, receiver_id, transaction_id, transfer_amount) VALUES (?, ?, ?, ?)";
+            PreparedStatement psLogFundTransfer = conn.c.prepareStatement(logFundTransferQuery);
+            psLogFundTransfer.setInt(1, senderUserId);
+            psLogFundTransfer.setInt(2, recipientUserId);
+            psLogFundTransfer.setInt(3, transactionId);
+            psLogFundTransfer.setDouble(4, amount);
+            psLogFundTransfer.executeUpdate();
 
+            conn.c.commit(); // Commit transaction
             JOptionPane.showMessageDialog(this, "Transfer Successful!", "Success", JOptionPane.INFORMATION_MESSAGE);
-            setVisible(false);
-            new Main_class(pin).setVisible(true);
+            
+            textRecipient.setText("");
+            textAmount.setText("");
 
-        } catch (NumberFormatException ex) {
-            JOptionPane.showMessageDialog(this, "Invalid amount. Please enter a valid number.", "Error", JOptionPane.ERROR_MESSAGE);
-        } catch (SQLException ex) {
+        } catch (SQLException e) {
             try {
-                if (conn != null) {
-                    conn.c.rollback(); 
-                }
+                Connn conn = new Connn(); // ✅ Fix: Ensure rollback has a connection instance
+                conn.c.rollback(); // Rollback on error
             } catch (SQLException rollbackEx) {
                 rollbackEx.printStackTrace();
             }
-            ex.printStackTrace();
-            JOptionPane.showMessageDialog(this, "Database error. Please try again later.", "Error", JOptionPane.ERROR_MESSAGE);
+            e.printStackTrace();
+            JOptionPane.showMessageDialog(this, "Transfer Failed. Please try again.", "Error", JOptionPane.ERROR_MESSAGE);
         } finally {
             try {
-                if (conn != null) {
-                    conn.c.close();
-                }
-            } catch (SQLException closeEx) {
-                closeEx.printStackTrace();
+                Connn conn = new Connn(); // ✅ Fix: Ensure setAutoCommit(true) has a connection instance
+                conn.c.setAutoCommit(true);
+            } catch (SQLException ex) {
+                ex.printStackTrace();
             }
         }
     } else if (ae.getSource() == bBack) {
@@ -229,6 +238,7 @@ public void actionPerformed(ActionEvent ae) {
         new Main_class(pin).setVisible(true);
     }
 }
+
 
     public static void main(String[] args) {
         new Transfer("");  
